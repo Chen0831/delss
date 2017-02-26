@@ -8,7 +8,7 @@
         "443":{},
         "80":{"obfs":"http_post_compatible"},
         "3380":{"obfs":"http_post_compatible"},
-        "9379":{"obfs":"auth_aes128_md5"},
+        "9379":{"obfs":"auth_aes128_sha1"},
         "9345":{}
     },
     "password": "q4Gv9ImqX",
