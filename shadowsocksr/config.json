@@ -4,11 +4,13 @@
     "server_port": 9345,
     "local_address": "127.0.0.1",
     "local_port": 1080,
+
     "port_password":{
         "443":{},
         "80":{"obfs":"http_post_compatible"},
         "3380":{"obfs":"http_post_compatible"},
-        "9379":{"obfs":"auth_aes128_sha1"},
+        "9343":{"protocol":"auth_aes128_sha1_compatible"},
+        "9344":{"protocol":"auth_aes128_md5_compatible"},
         "9345":{}
     },
     "password": "q4Gv9ImqX",

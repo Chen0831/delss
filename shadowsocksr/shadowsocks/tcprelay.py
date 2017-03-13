@@ -27,6 +27,8 @@ import binascii
 import traceback
 import random
 import platform
+import threading
+from collections import deque
 
 from shadowsocks import encrypt, obfs, eventloop, shell, common, lru_cache
 from shadowsocks.common import pre_parse_header, parse_header
@@ -92,6 +94,33 @@ WAIT_STATUS_READWRITING = WAIT_STATUS_READING | WAIT_STATUS_WRITING
 BUF_SIZE = 32 * 1024
 UDP_MAX_BUF_SIZE = 65536
 
+class SpeedTester(object):
+    def __init__(self, max_speed = 0):
+        self.max_speed = max_speed * 1024
+        self.timeout = 1
+        self._cache = deque()
+        self.sum_len = 0
+
+    def update_limit(self, max_speed):
+        self.max_speed = max_speed * 1024
+
+    def add(self, data_len):
+        if self.max_speed > 0:
+            self._cache.append((time.time(), data_len))
+            self.sum_len += data_len
+
+    def isExceed(self):
+        if self.max_speed > 0:
+            if self.sum_len > 0:
+                cut_t = time.time()
+                t = max(cut_t - self._cache[0][0], 0.01)
+                speed = self.sum_len / t
+                if self._cache[0][0] + self.timeout < cut_t:
+                    self.sum_len -= self._cache[0][1]
+                    self._cache.popleft()
+                return speed >= self.max_speed
+        return False
+
 class TCPRelayHandler(object):
     def __init__(self, server, fd_to_handlers, loop, local_sock, config,
                  dns_resolver, is_local):
@@ -106,6 +135,8 @@ class TCPRelayHandler(object):
         self._dns_resolver = dns_resolver
         self._client_address = local_sock.getpeername()[:2]
         self._accept_address = local_sock.getsockname()[:2]
+        self._user = None
+        self._user_id = server._listen_port
 
         # TCP Relay works as either sslocal or ssserver
         # if is_local, this is sslocal
@@ -123,6 +154,8 @@ class TCPRelayHandler(object):
         server_info = obfs.server_info(server.obfs_data)
         server_info.host = config['server']
         server_info.port = server._listen_port
+        #server_info.users = server.server_users
+        #server_info.update_user_func = self._update_user
         server_info.client = self._client_address[0]
         server_info.client_port = self._client_address[1]
         server_info.protocol_param = ''
@@ -139,6 +172,8 @@ class TCPRelayHandler(object):
         server_info = obfs.server_info(server.protocol_data)
         server_info.host = config['server']
         server_info.port = server._listen_port
+        server_info.users = server.server_users
+        server_info.update_user_func = self._update_user
         server_info.client = self._client_address[0]
         server_info.client_port = self._client_address[1]
         server_info.protocol_param = config['protocol_param']
@@ -183,6 +218,8 @@ class TCPRelayHandler(object):
         self._update_activity()
         self._server.add_connection(1)
         self._server.stat_add(self._client_address[0], 1)
+        self.speed_tester_u = SpeedTester(config.get("speed_limit_per_con", 0))
+        self.speed_tester_d = SpeedTester(config.get("speed_limit_per_con", 0))
 
     def __hash__(self):
         # default __hash__ is id / 16
@@ -202,6 +239,10 @@ class TCPRelayHandler(object):
             server = random.choice(server)
         logging.debug('chosen server: %s:%d', server, server_port)
         return server, server_port
+
+    def _update_user(self, user):
+        self._user = user
+        self._user_id = struct.unpack('<I', user)[0]
 
     def _update_activity(self, data_len=0):
         # tell the TCP Relay we have activities recently
@@ -303,8 +344,8 @@ class TCPRelayHandler(object):
             try:
                 if self._encrypt_correct:
                     if sock == self._remote_sock:
-                        self._server.server_transfer_ul += len(data)
-                        self._update_activity(len(data))
+                        self._server.add_transfer_u(self._user, len(data))
+                self._update_activity(len(data))
                 if data:
                     l = len(data)
                     s = sock.send(data)
@@ -716,6 +757,9 @@ class TCPRelayHandler(object):
         if not data:
             self.destroy()
             return
+
+        self.speed_tester_u.add(len(data))
+        self._server.speed_tester_u(self._user_id).add(len(data))
         ogn_data = data
         if not is_local:
             if self._encryptor is not None:
@@ -810,6 +854,9 @@ class TCPRelayHandler(object):
         if not data:
             self.destroy()
             return
+
+        self.speed_tester_d.add(len(data))
+        self._server.speed_tester_d(self._user_id).add(len(data))
         if self._encryptor is not None:
             if self._is_local:
                 try:
@@ -838,8 +885,8 @@ class TCPRelayHandler(object):
                     data = self._protocol.server_pre_encrypt(data)
                     data = self._encryptor.encrypt(data)
                     data = self._obfs.server_encode(data)
-            self._update_activity(len(data))
-            self._server.server_transfer_dl += len(data)
+                    self._server.add_transfer_d(self._user, len(data))
+                self._update_activity(len(data))
         else:
             return
         try:
@@ -871,52 +918,70 @@ class TCPRelayHandler(object):
             self._update_stream(STREAM_UP, WAIT_STATUS_READING)
 
     def _on_local_error(self):
-        logging.debug('got local error')
         if self._local_sock:
-            logging.error(eventloop.get_sock_error(self._local_sock))
-            logging.error("exception from %s:%d" % (self._client_address[0], self._client_address[1]))
+            err = eventloop.get_sock_error(self._local_sock)
+            if err.errno not in [errno.ECONNRESET, errno.EPIPE]:
+                logging.error(err)
+                logging.error("local error, exception from %s:%d" % (self._client_address[0], self._client_address[1]))
         self.destroy()
 
     def _on_remote_error(self):
-        logging.debug('got remote error')
         if self._remote_sock:
-            logging.error(eventloop.get_sock_error(self._remote_sock))
-            if self._remote_address:
-                logging.error("when connect to %s:%d" % (self._remote_address[0], self._remote_address[1]))
-            else:
-                logging.error("exception from %s:%d" % (self._client_address[0], self._client_address[1]))
+            err = eventloop.get_sock_error(self._remote_sock)
+            if err.errno not in [errno.ECONNRESET]:
+                logging.error(err)
+                if self._remote_address:
+                    logging.error("remote error, when connect to %s:%d" % (self._remote_address[0], self._remote_address[1]))
+                else:
+                    logging.error("remote error, exception from %s:%d" % (self._client_address[0], self._client_address[1]))
         self.destroy()
 
     def handle_event(self, sock, event):
         # handle all events in this handler and dispatch them to methods
+        handle = False
         if self._stage == STAGE_DESTROYED:
             logging.debug('ignore handle_event: destroyed')
-            return
+            return True
+        if self._user is not None and self._user not in self._server.server_users:
+            self.destroy()
+            return True
         # order is important
         if sock == self._remote_sock or sock == self._remote_sock_v6:
             if event & eventloop.POLL_ERR:
+                handle = True
                 self._on_remote_error()
                 if self._stage == STAGE_DESTROYED:
-                    return
+                    return True
             if event & (eventloop.POLL_IN | eventloop.POLL_HUP):
-                self._on_remote_read(sock == self._remote_sock)
-                if self._stage == STAGE_DESTROYED:
-                    return
+                if not self.speed_tester_d.isExceed():
+                    if not self._server.speed_tester_d(self._user_id).isExceed():
+                        handle = True
+                        self._on_remote_read(sock == self._remote_sock)
+                        if self._stage == STAGE_DESTROYED:
+                            return True
             if event & eventloop.POLL_OUT:
+                handle = True
                 self._on_remote_write()
         elif sock == self._local_sock:
             if event & eventloop.POLL_ERR:
+                handle = True
                 self._on_local_error()
                 if self._stage == STAGE_DESTROYED:
-                    return
+                    return True
             if event & (eventloop.POLL_IN | eventloop.POLL_HUP):
-                self._on_local_read()
-                if self._stage == STAGE_DESTROYED:
-                    return
+                if not self.speed_tester_u.isExceed():
+                    if not self._server.speed_tester_u(self._user_id).isExceed():
+                        handle = True
+                        self._on_local_read()
+                        if self._stage == STAGE_DESTROYED:
+                            return True
             if event & eventloop.POLL_OUT:
+                handle = True
                 self._on_local_write()
         else:
             logging.warn('unknown socket from %s:%d' % (self._client_address[0], self._client_address[1]))
+
+        return handle
 
     def _log_error(self, e):
         logging.error('%s when handling connection from %s:%d' %
@@ -989,6 +1054,12 @@ class TCPRelay(object):
         self._fd_to_handlers = {}
         self.server_transfer_ul = 0
         self.server_transfer_dl = 0
+        self.server_users = {}
+        self.server_user_transfer_ul = {}
+        self.server_user_transfer_dl = {}
+        self.mu = False
+        self._speed_tester_u = {}
+        self._speed_tester_d = {}
         self.server_connections = 0
         self.protocol_data = obfs.obfs(config['protocol']).init_data()
         self.obfs_data = obfs.obfs(config['obfs']).init_data()
@@ -1007,6 +1078,9 @@ class TCPRelay(object):
             listen_addr = config['server']
             listen_port = config['server_port']
         self._listen_port = listen_port
+
+        if common.to_bytes(config['protocol']) in [b"auth_aes128_md5", b"auth_aes128_sha1"]:
+            self._update_users(None, None)
 
         addrs = socket.getaddrinfo(listen_addr, listen_port, 0,
                                    socket.SOCK_STREAM, socket.SOL_TCP)
@@ -1046,6 +1120,91 @@ class TCPRelay(object):
     def add_connection(self, val):
         self.server_connections += val
         logging.debug('server port %5d connections = %d' % (self._listen_port, self.server_connections,))
+
+    def get_ud(self):
+        return (self.server_transfer_ul, self.server_transfer_dl)
+
+    def get_users_ud(self):
+        return (self.server_user_transfer_ul.copy(), self.server_user_transfer_dl.copy())
+
+    def _update_users(self, protocol_param, acl):
+        if protocol_param is None:
+            protocol_param = self._config['protocol_param']
+        param = common.to_bytes(protocol_param).split(b'#')
+        if len(param) == 2:
+            self.mu = True
+            user_list = param[1].split(b',')
+            if user_list:
+                for user in user_list:
+                    items = user.split(b':')
+                    if len(items) == 2:
+                        user_int_id = int(items[0])
+                        uid = struct.pack('<I', user_int_id)
+                        if acl is not None and user_int_id not in acl:
+                            self.del_user(uid)
+                        else:
+                            passwd = items[1]
+                            self.add_user(uid, passwd)
+
+    def update_user(self, id, passwd):
+        uid = struct.pack('<I', id)
+        self.add_user(uid, passwd)
+
+    def update_users(self, users):
+        for uid in list(self.server_users.keys()):
+            id = struct.unpack('<I', uid)[0]
+            if id not in users:
+                self.del_user(uid)
+        for id in users:
+            uid = struct.pack('<I', id)
+            self.add_user(uid, users[id])
+
+    def add_user(self, user, passwd): # user: binstr[4], passwd: str
+        self.server_users[user] = common.to_bytes(passwd)
+
+    def del_user(self, user):
+        if user in self.server_users:
+            del self.server_users[user]
+
+    def add_transfer_u(self, user, transfer):
+        if user is None:
+            self.server_transfer_ul += transfer
+        else:
+            if user not in self.server_user_transfer_ul:
+                self.server_user_transfer_ul[user] = 0
+            self.server_user_transfer_ul[user] += transfer + self.server_transfer_ul
+            self.server_transfer_ul = 0
+
+    def add_transfer_d(self, user, transfer):
+        if user is None:
+            self.server_transfer_dl += transfer
+        else:
+            if user not in self.server_user_transfer_dl:
+                self.server_user_transfer_dl[user] = 0
+            self.server_user_transfer_dl[user] += transfer + self.server_transfer_dl
+            self.server_transfer_dl = 0
+
+    def speed_tester_u(self, uid):
+        if uid not in self._speed_tester_u:
+            if self.mu: #TODO
+                self._speed_tester_u[uid] = SpeedTester(self._config.get("speed_limit_per_user", 0))
+            else:
+                self._speed_tester_u[uid] = SpeedTester(self._config.get("speed_limit_per_user", 0))
+        return self._speed_tester_u[uid]
+
+    def speed_tester_d(self, uid):
+        if uid not in self._speed_tester_d:
+            if self.mu: #TODO
+                self._speed_tester_d[uid] = SpeedTester(self._config.get("speed_limit_per_user", 0))
+            else:
+                self._speed_tester_d[uid] = SpeedTester(self._config.get("speed_limit_per_user", 0))
+        return self._speed_tester_d[uid]
+
+    def update_limit(self, uid, max_speed):
+        if uid in self._speed_tester_u:
+            self._speed_tester_u[uid].update_limit(max_speed)
+        if uid in self._speed_tester_d:
+            self._speed_tester_d[uid].update_limit(max_speed)
 
     def update_stat(self, port, stat_dict, val):
         newval = stat_dict.get(0, 0) + val
